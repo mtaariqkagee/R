@@ -36,7 +36,7 @@ cat('And the percentage of missing is',
 
 #replace missings
 (high_miss <- names(which(colMeans(is.na(df)) >= 0.8)))
-summary(df$time_std_T6)
+summary(df$var)
 
 #transformations
 range01 <- function(x){
