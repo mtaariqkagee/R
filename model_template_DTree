@@ -1,0 +1,252 @@
+rm(list=ls())
+gc()
+if (!require('pacman')) install.packages('pacman')
+pacman::p_load('caret', 'caTools', 'class','corrplot',
+                'DBI', 'e1071', 'gbm', 'GGally','ggplot2',
+                'ggrepel', 'gridExtra', 'gsubfn', 'ggthemes', 'Hmisc',
+                'iterators', 'lattice', 'MASS','MatrixModels','modelr',
+                'multcomp', 'mvtnorm', 'parallel', 'plotly','plotrix',
+                'proto', 'randomForest','rattle', 'RColorBrewer', 
+                'readr', 'readxl', 'reprex', 'ROCR', 'rpart',
+                'RSQLite', 'scales','splines', 'sqldf', 
+                'survival', 'tictoc', 'TH.data',
+                'tidyverse', 'xgboost')
+tic("reading in data --->")
+df <- read.csv("../input.csv", stringsAsFactors = FALSE)
+toc()
+#splitting numeric and categorical
+categorical_vars <- names(df)[which(sapply(df, is.character))]
+(categorical_vars <- c(categorical_vars,
+                       "other_stuff"))
+(numerical_vars <- names(df)[!names(df) %in% c(categorical_vars, "Target")])
+
+#making categories factors - is this necessary?
+# df$Target <- as.factor(df$Target)
+# df[categorical_vars] <- df[categorical_vars] %>% 
+#   mutate_all(funs(as.numeric(as.factor(.))))
+
+#basic info on data - glimpse / str is useless on so many vars
+cat('df has', dim(df)[1], 'rows and', dim(df)[2] - 1, ' columns.')
+cat('Of which', length(categorical_vars), 'are categorical and',
+    length(numerical_vars), 'are numeric')
+cat('The number of duplicated rows are', 
+    nrow(df) - nrow(unique(df)))
+cat('And the percentage of missing is', 
+    100*round((sum(is.na(df)) / (nrow(df) * ncol(df))), 4), '%')
+
+#replace missings
+(high_miss <- names(which(colMeans(is.na(df)) >= 0.8)))
+summary(df$time_std_T6)
+
+#transformations
+range01 <- function(x){
+  ((x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))) 
+}
+
+df_transformed <- df
+
+tic("Transformations --->")
+df_transformed[numerical_vars] <- df_transformed[numerical_vars] %>%
+  mutate_all(funs(ifelse(. < 0,-log(. * -1),log(. + 1)))) 
+
+df_transformed[numerical_vars] <- df_transformed[numerical_vars] %>%
+  mutate_all(funs(ifelse(is.na(.),-1,.)))
+
+df_transformed[numerical_vars]  <- df_transformed[numerical_vars] %>%
+  mutate_all(funs(range01))
+toc()
+
+#apply cutoff to outliers - generic outlier indicator used above
+# replace_outlier <- function(x){
+#   quantiles <- quantile( x, c(.01, .99 ), na.rm=TRUE )
+#   x[ x < quantiles[1] ] <- quantiles[1]
+#   x[ x > quantiles[2] ] <- quantiles[2]
+#   x
+# }
+# df_clean <- df_transformed[numerical_vars] %>% 
+#   mutate_all(funs(replace_outlier))
+
+#visualizations - distribution of categorical vars by Target
+# for(category in categorical_vars){
+#       print(ggplot(data=df_transformed, aes_string(x=(category)))+
+#               geom_bar() +
+#               facet_wrap(~Target, scales = 'free'))
+# }
+
+#distribution of numerical vars
+# for(category in numerical_vars){
+#   print(ggplot(data=df_transformed, aes_string((category)))+
+#           geom_histogram(aes(y = ..density..), bins = 50) +
+#           geom_density(fill='darkblue', alpha=.3, adjust = 2) + 
+#           geom_vline(aes_string(xintercept=mean(df_transformed[[category]], na.rm = TRUE)),
+#                      size=1.5, alpha=.5, color='darkred'))
+# }
+
+#removing very highly correlated vars 
+#(spearman instead of pearson for robustness to outliers)
+corr_matrix <- cor(df_transformed[numerical_vars], method = "spearman")
+# write.csv(corr_matrix, "corr_matrix.csv")
+(highlyCorrelated <- findCorrelation(corr_matrix, cutoff = 2/3))
+
+(corr_vars=names(df_transformed[numerical_vars][,highlyCorrelated]))
+
+gc()
+df_new <- df_transformed[-which(names(df_transformed) %in% corr_vars)]
+names(df_new)
+cat('df1 has', dim(df_transformed)[2], 
+    'cols and df2 has', dim(df_new)[2], ' cols')
+
+#visualize remaining correlations with significance levels
+# cor_5 <- rcorr(as.matrix(df_new))
+# M <- cor_5$r
+# p_mat <- cor_5$P
+# corrplot(M, method = "color", type = "upper", order = "hclust", 
+#          p.mat = p_mat, sig.level = 0.01,
+#          addCoef.col = "black", diag = FALSE, tl.col = "darkblue")
+
+# sampling
+sample_size =floor(0.7 * nrow(df_new))
+set.seed(2501)
+train_ind <-  sample(seq_len(nrow(df_new)), size = sample_size)
+train <-  df_new[train_ind, ]
+test <-  df_new[-train_ind, ]
+
+cat("Train has :", nrow(train), " rows, and test has:", nrow(test), "rows")
+
+table(train$Target)
+table(test$Target)
+
+# decision tree
+tic("Decision tree --->")
+model1 <- rpart(Target ~ ., data = train)
+toc()
+summary(model1)
+printcp(model1)
+plotcp(model1)
+rsq.rpart(model1)
+rpart.plot::rpart.plot(model1)
+
+(var_importance <- varImp(model1, scale = FALSE) %>%
+    mutate(names = rownames(.)) %>% 
+    filter(Overall > 0) %>% 
+    arrange(desc(Overall)))
+
+pred_Dtree=predict(model1,newdata=test)
+summary(pred_Dtree)
+p_class <- as.factor(ifelse(pred_Dtree >= 0.5, 1, 0))
+(confuse_m <- caret::confusionMatrix(p_class, as.factor(test$Target), positive = '1'))
+(t=table(pred_Dtree >= 0.5, test$Target))
+train1 <- train %>% select(Target, var_importance$names)
+
+# GBM
+tic("GBM --->")
+gbm1 <- gbm(Target ~ . ,
+            data=train,distribution="bernoulli",
+            n.trees= 173,interaction.depth=13,cv.folds = 5, 
+            n.minobsinnode = 15,shrinkage = 0.05)
+toc()
+summary(gbm1)
+gbm.perf(gbm1) 
+(importance = summary.gbm(gbm1, plotit=TRUE))
+test$gbm_est=predict.gbm(gbm1,newdata=test,n.trees=167,type='response')
+summary(test$gbm_est)
+p_class_G <- as.factor(ifelse(test$gbm_est >= 0.5, 1, 0))
+(confuse_m1 <- caret::confusionMatrix(p_class_G, as.factor(test$Target), positive = '1'))
+
+(var_importance_GB <- summary.gbm(gbm1) %>% 
+    mutate(names = rownames(.)) %>% 
+    filter(rel.inf > 1) %>% 
+    arrange(desc(rel.inf)))
+
+s=cbind(test$gbm_est,test$Target)
+q=prediction(s[,1],s[,2])
+perf2 = performance(q,"tpr","fpr")
+plot(perf2,main="Trees ROC Curve")
+auc1 = performance(q,"auc")
+(auc1 = unlist(slot(auc1, "y.values")))
+
+(Gini_Tr=2*auc1-1)
+
+deciles <- test %>% arrange(desc(gbm_est)) %>% 
+  mutate(decile1 = ntile(gbm_est, 10))
+
+deciles %>% select(Target, gbm_est, decile1) %>%
+  group_by(decile1) %>% filter(Target == 1) %>% 
+  summarise(est_mean = mean(gbm_est),
+            est_count = sum(Target))
+
+# RF
+train1 <- train %>% select(Target, var_importance_GB$names)
+tic("RF --->")
+rand1 <- randomForest(as.factor(Target) ~ . ,
+                      data=train1, importance=TRUE, 
+                      ntree=167,
+                      mtry=10)
+toc()
+plot(rand1, ylim=c(0,0.36))
+legend('topright', colnames(rand1$err.rate), col=1:3, fill=1:3)
+# Get importance
+importance <- randomForest::importance(rand1)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[ ,'MeanDecreaseGini'],2))
+
+# Create a rank variable based on importance
+rankImportance <- varImportance %>%
+  mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+
+# Use ggplot2 to visualize the relative importance of variables
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+                           y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  geom_text(aes(x = Variables, y = 0.5, label = Rank),
+            hjust=0, vjust=0.55, size = 4, colour = 'red') +
+  labs(x = 'Variables') +
+  coord_flip() + 
+  theme_few()
+
+pred_r=predict(rand1,test,type="prob")[,2]
+
+p_class_RF <- as.factor(ifelse(pred_r >= 0.5, 1, 0))
+(confuse_m2 <- caret::confusionMatrix(p_class_RF, as.factor(test$Target),
+                                      positive = '1'))
+
+cat("% Var explained: \n", 100 * (1-sum((as.numeric(rand1$y)-as.numeric(rand1$pred))^2) /
+                                    sum((as.numeric(rand1$y)-mean(as.numeric(rand1$y)))^2)))
+
+# XGB
+p <- list(objective = "binary:logistic",
+          booster = "gbtree",
+          eval_metric = "auc",
+          nthread = 8,
+          eta = 0.025,
+          max_depth = 6,
+          min_child_weight = 19,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.632,
+          alpha = 0,
+          lambda = 0.05,
+          nrounds = 300)
+
+test1 <- test %>% select(Target, var_importance_GB$names)
+y_train <- train1$Target
+y_test <- test1$Target
+dtrain <- xgb.DMatrix(data = as.matrix(train1[-1]), label = y_train)
+dtest <- xgb.DMatrix(data = as.matrix(test1[-1], label = y_test))
+m_xgb <- xgb.train(p, dtrain, p$nrounds, list(train = dtrain),
+                   print_every_n = 5, early_stopping_rounds = 30)
+
+
+xgb.importance(model=m_xgb) %>% 
+  xgb.plot.importance(top_n = 25)
+
+model <- xgboost(data = dtrain, # the data   
+                 nround = 100, # max number of boosting iterations
+                 objective = "binary:logistic")
+
+
+pred <- predict(m_xgb, dtest)
+
+# get & print the classification error
+err <- mean(as.numeric(pred > 0.5) != Target)
+print(paste("test-error=", err))
