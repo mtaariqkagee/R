@@ -17,3 +17,5 @@ v) now i descrease the eta to 0.05, and leave program running then get the optim
 after these step you can get roughly good parameters (i dont claim best ones), then you can play around these parameters.
 
 hope it helps
+
+https://www.kaggle.com/c/bnp-paribas-cardif-claims-management/discussion/19083#108783
